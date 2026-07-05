@@ -1,0 +1,49 @@
+{
+  "name": "@bitsentry/plugin-wazuh",
+  "version": "0.1.0",
+  "description": "BitSentry code plugin for Wazuh alerts and index queries.",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.32.1",
+  "main": "./dist/plugin.js",
+  "types": "./dist/plugin.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write .",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/bitsentry-ai/bitsentry-plugin-wazuh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bitsentry-ai/bitsentry-plugin-wazuh/issues"
+  },
+  "homepage": "https://github.com/bitsentry-ai/bitsentry-plugin-wazuh#readme",
+  "devDependencies": {
+    "@bitsentry/plugin-sdk": "^0.1.0",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.3.0",
+    "eslint": "^10.5.0",
+    "globals": "^17.6.0",
+    "prettier": "^3.8.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.61.1",
+    "vitest": "^4.0.8"
+  }
+}
