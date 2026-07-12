@@ -23,8 +23,8 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "lint": "eslint .",
-    "lint:fix": "eslint . --fix",
+    "lint": "node scripts/eslint/ts7-unavailable.mjs",
+    "lint:fix": "node scripts/eslint/ts7-unavailable.mjs",
     "test": "vitest run"
   },
   "repository": {
