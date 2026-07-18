@@ -1,4 +1,84 @@
 import type { DesktopCodePlugin } from "@bitsentry/plugin-sdk";
+import { Effect } from "effect";
+
+const WAZUH_REQUEST_TIMEOUT_MS = 30_000;
+
+type PluginOperationContext = {
+  signal?: AbortSignal;
+  deadlineAt?: number;
+};
+
+function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const activeSignals = signals.filter(
+    (signal): signal is AbortSignal => signal !== undefined && !signal.aborted,
+  );
+
+  if (signals.some((signal) => signal?.aborted === true)) {
+    abort();
+  } else {
+    for (const signal of activeSignals) {
+      signal.addEventListener("abort", abort, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    dispose() {
+      for (const signal of activeSignals) {
+        signal.removeEventListener("abort", abort);
+      }
+    },
+  };
+}
+
+function operationTimeoutMs(operation?: PluginOperationContext): number {
+  if (typeof operation?.deadlineAt !== "number") {
+    return WAZUH_REQUEST_TIMEOUT_MS;
+  }
+
+  return Math.max(
+    0,
+    Math.min(WAZUH_REQUEST_TIMEOUT_MS, operation.deadlineAt - Date.now()),
+  );
+}
+
+function readOperationContext(context): PluginOperationContext | undefined {
+  return (context as { operation?: PluginOperationContext }).operation;
+}
+
+async function runWazuhRequest<T>(
+  operation: string,
+  parentOperation: PluginOperationContext | undefined,
+  execute: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const timeoutMs = operationTimeoutMs(parentOperation);
+
+  return Effect.runPromise(
+    Effect.tryPromise({
+      try: async (effectSignal) => {
+        const linkedSignal = linkAbortSignals([
+          parentOperation?.signal,
+          effectSignal,
+        ]);
+        try {
+          return await execute(linkedSignal.signal);
+        } finally {
+          linkedSignal.dispose();
+        }
+      },
+      catch: (cause) =>
+        cause instanceof Error ? cause : new Error(`${operation} failed`),
+    }).pipe(
+      Effect.timeoutFail({
+        duration: timeoutMs,
+        onTimeout: () =>
+          new Error(`${operation} timed out after ${String(timeoutMs)}ms`),
+      }),
+    ),
+  );
+}
 
 function readString(value, fallback = "") {
   if (typeof value === "string") {
@@ -334,7 +414,8 @@ function formatOutput(input) {
   return lines.join("\n");
 }
 
-async function searchAlerts({ auth, input }) {
+async function searchAlerts(context) {
+  const { auth, input } = context;
   const indexUrl = resolveWazuhIndexUrl(auth.indexUrl);
   const indexUsername = readString(auth.indexUsername, "admin");
   const indexPassword = requireString(auth.indexPassword, "indexPassword");
@@ -345,26 +426,32 @@ async function searchAlerts({ auth, input }) {
   const credentials = Buffer.from(`${indexUsername}:${indexPassword}`).toString(
     "base64",
   );
-  const response = await fetch(`${indexUrl}/${indexPattern}/_search`, {
-    method: "POST",
-    redirect: "error",
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: buildQuery(input),
-      size: limit,
-      from: offset,
-      sort: [
-        {
-          "@timestamp": {
-            order: "desc",
-          },
+  const response = await runWazuhRequest(
+    "Wazuh alert search",
+    readOperationContext(context),
+    (signal) =>
+      fetch(`${indexUrl}/${indexPattern}/_search`, {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          Authorization: `Basic ${credentials}`,
+          "Content-Type": "application/json",
         },
-      ],
-    }),
-  });
+        body: JSON.stringify({
+          query: buildQuery(input),
+          size: limit,
+          from: offset,
+          sort: [
+            {
+              "@timestamp": {
+                order: "desc",
+              },
+            },
+          ],
+        }),
+        signal,
+      }),
+  );
 
   if (!response.ok) {
     if (response.status === 404) {
@@ -420,6 +507,7 @@ async function queryIssues(context) {
       ...context.input,
       offset,
     },
+    operation: readOperationContext(context),
   });
   const data = readRecord(result.data) ?? {};
   const items = Array.isArray(data.items) ? data.items : [];

@@ -6,6 +6,10 @@ settings:
 
 importers:
   .:
+    dependencies:
+      effect:
+        specifier: 3.22.0
+        version: 3.22.0
     devDependencies:
       "@bitsentry/plugin-sdk":
         specifier: ^0.1.0
@@ -780,6 +784,12 @@ packages:
       }
     engines: { node: ">=8" }
 
+  effect@3.22.0:
+    resolution:
+      {
+        integrity: sha512-jhYFe0zTlIRqYFrKTS+6luhmS/Tm0f+JLo0K9KUxvtFab1SUGEszQi2ehOP6QzAZvy831lDmTwwzvVDZSPNz3g==,
+      }
+
   es-module-lexer@2.3.0:
     resolution:
       {
@@ -874,6 +884,13 @@ packages:
         integrity: sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==,
       }
     engines: { node: ">=12.0.0" }
+
+  fast-check@3.23.2:
+    resolution:
+      {
+        integrity: sha512-h5+1OzzfCC3Ef7VbtKdcv7zsstUQwUDlYpUTvjeUsJAssPgLn7QzbboPtL5ro04Mq0rPOsMzl7q5hIbRs2wD1A==,
+      }
+    engines: { node: ">=8.0.0" }
 
   fast-deep-equal@3.1.3:
     resolution:
@@ -1265,6 +1282,12 @@ packages:
         integrity: sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg==,
       }
     engines: { node: ">=6" }
+
+  pure-rand@6.1.0:
+    resolution:
+      {
+        integrity: sha512-bVWawvoZoBYpp6yIoQtQXHZjmz35RSVHnUOTefl8Vcjr8snTPY1wnpSPMWekcFwbxI6gtmT7rSYPFvz71ldiOA==,
+      }
 
   rolldown@1.1.4:
     resolution:
@@ -1914,6 +1937,11 @@ snapshots:
 
   detect-libc@2.1.2: {}
 
+  effect@3.22.0:
+    dependencies:
+      "@standard-schema/spec": 1.1.0
+      fast-check: 3.23.2
+
   es-module-lexer@2.3.0: {}
 
   escape-string-regexp@4.0.0: {}
@@ -1987,6 +2015,10 @@ snapshots:
   esutils@2.0.3: {}
 
   expect-type@1.4.0: {}
+
+  fast-check@3.23.2:
+    dependencies:
+      pure-rand: 6.1.0
 
   fast-deep-equal@3.1.3: {}
 
@@ -2159,6 +2191,8 @@ snapshots:
   prettier@3.9.4: {}
 
   punycode@2.3.1: {}
+
+  pure-rand@6.1.0: {}
 
   rolldown@1.1.4:
     dependencies:
