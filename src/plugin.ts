@@ -1,4 +1,28 @@
 import type { DesktopCodePlugin } from "@bitsentry/plugin-sdk";
+import { Effect } from "effect";
+
+const WAZUH_REQUEST_TIMEOUT_MS = 30_000;
+
+async function runWazuhRequest<T>(
+  operation: string,
+  execute: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return Effect.runPromise(
+    Effect.tryPromise({
+      try: execute,
+      catch: (cause) =>
+        cause instanceof Error ? cause : new Error(`${operation} failed`),
+    }).pipe(
+      Effect.timeoutFail({
+        duration: WAZUH_REQUEST_TIMEOUT_MS,
+        onTimeout: () =>
+          new Error(
+            `${operation} timed out after ${String(WAZUH_REQUEST_TIMEOUT_MS)}ms`,
+          ),
+      }),
+    ),
+  );
+}
 
 function readString(value, fallback = "") {
   if (typeof value === "string") {
@@ -345,26 +369,29 @@ async function searchAlerts({ auth, input }) {
   const credentials = Buffer.from(`${indexUsername}:${indexPassword}`).toString(
     "base64",
   );
-  const response = await fetch(`${indexUrl}/${indexPattern}/_search`, {
-    method: "POST",
-    redirect: "error",
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: buildQuery(input),
-      size: limit,
-      from: offset,
-      sort: [
-        {
-          "@timestamp": {
-            order: "desc",
+  const response = await runWazuhRequest("Wazuh alert search", (signal) =>
+    fetch(`${indexUrl}/${indexPattern}/_search`, {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query: buildQuery(input),
+        size: limit,
+        from: offset,
+        sort: [
+          {
+            "@timestamp": {
+              order: "desc",
+            },
           },
-        },
-      ],
+        ],
+      }),
+      signal,
     }),
-  });
+  );
 
   if (!response.ok) {
     if (response.status === 404) {
