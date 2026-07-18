@@ -135,6 +135,36 @@ describe("Wazuh plugin package", () => {
     });
   });
 
+  it("aborts an in-flight alert search when the parent operation is cancelled", async () => {
+    const controller = new AbortController();
+    let requestSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(
+      (_url: string, request?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          requestSignal = request?.signal ?? undefined;
+          requestSignal?.addEventListener(
+            "abort",
+            () => reject(new Error("aborted")),
+            {
+              once: true,
+            },
+          );
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = action("search_alerts").execute({
+      ...context("search_alerts", { indexPattern: "wazuh-alerts-*" }),
+      operation: { signal: controller.signal },
+    } as DesktopPluginCodeActionContext);
+
+    await vi.waitFor(() => expect(requestSignal).toBeDefined());
+    controller.abort();
+
+    await expect(result).rejects.toThrow();
+    expect(requestSignal?.aborted).toBe(true);
+  });
+
   it("rejects non-HTTP Wazuh index URLs before sending basic credentials", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
