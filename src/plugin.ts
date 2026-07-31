@@ -10,7 +10,9 @@ type PluginOperationContext = {
 
 function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]) {
   const controller = new AbortController();
-  const abort = () => { controller.abort(); };
+  const abort = () => {
+    controller.abort();
+  };
   const activeSignals = signals.filter(
     (signal): signal is AbortSignal => signal !== undefined && !signal.aborted,
   );
