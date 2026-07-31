@@ -23,8 +23,9 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "lint": "node scripts/eslint/ts7-unavailable.mjs",
-    "lint:fix": "node scripts/eslint/ts7-unavailable.mjs",
+    "lint": "pnpm run lint:ts6",
+    "lint:fix": "node scripts/eslint/verify-ts6-linter.mjs && eslint . --fix",
+    "lint:ts6": "node scripts/eslint/verify-ts6-linter.mjs && eslint .",
     "test": "vitest run"
   },
   "repository": {
@@ -38,11 +39,12 @@
   "devDependencies": {
     "@bitsentry/plugin-sdk": "^0.1.0",
     "@eslint/js": "^10.0.1",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "@types/node": "^25.3.0",
     "eslint": "^10.5.0",
     "globals": "^17.6.0",
     "prettier": "^3.8.3",
-    "typescript": "^7.0.2",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.63.0",
     "vitest": "^4.0.8"
   },
