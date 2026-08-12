@@ -50,6 +50,48 @@ function readOperationContext(context): PluginOperationContext | undefined {
   return (context as { operation?: PluginOperationContext }).operation;
 }
 
+function readErrorCode(value: unknown): string | undefined {
+  if (!(value instanceof Error)) {
+    return undefined;
+  }
+
+  const code = (value as Error & { code?: unknown }).code;
+  if (typeof code === "string" && code.length > 0) {
+    return code;
+  }
+
+  return readErrorCode((value as Error & { cause?: unknown }).cause);
+}
+
+function describeRequestFailure(cause: unknown): string {
+  const code = readErrorCode(cause);
+  const description = (() => {
+    switch (code) {
+      case "UND_ERR_CONNECT_TIMEOUT":
+      case "ETIMEDOUT":
+        return "connection timed out";
+      case "ECONNREFUSED":
+        return "connection refused";
+      case "ECONNRESET":
+        return "connection reset";
+      case "ENOTFOUND":
+      case "EAI_AGAIN":
+        return "DNS lookup failed";
+      case "CERT_HAS_EXPIRED":
+      case "DEPTH_ZERO_SELF_SIGNED_CERT":
+      case "ERR_TLS_CERT_ALTNAME_INVALID":
+      case "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+        return "TLS certificate rejected";
+      default:
+        return cause instanceof Error && cause.message.trim().length > 0
+          ? cause.message.trim()
+          : "request failed";
+    }
+  })();
+
+  return code === undefined ? description : `${description} (${code})`;
+}
+
 async function runWazuhRequest<T>(
   operation: string,
   parentOperation: PluginOperationContext | undefined,
@@ -70,8 +112,13 @@ async function runWazuhRequest<T>(
           linkedSignal.dispose();
         }
       },
-      catch: (cause) =>
-        cause instanceof Error ? cause : new Error(`${operation} failed`),
+      catch: (cause) => {
+        const error = new Error(
+          `${operation} failed: ${describeRequestFailure(cause)}`,
+        ) as Error & { cause?: unknown };
+        error.cause = cause;
+        return error;
+      },
     }).pipe(
       Effect.timeoutFail({
         duration: timeoutMs,
@@ -429,7 +476,7 @@ async function searchAlerts(context) {
     "base64",
   );
   const response = await runWazuhRequest(
-    "Wazuh alert search",
+    `Wazuh alert search to ${indexUrl}`,
     readOperationContext(context),
     (signal) =>
       fetch(`${indexUrl}/${indexPattern}/_search`, {

@@ -169,6 +169,30 @@ describe("Wazuh plugin package", () => {
     expect(requestSignal?.aborted).toBe(true);
   });
 
+  it("reports a safe actionable error when the Wazuh index cannot be reached", async () => {
+    const connectError = Object.assign(new Error("Connect Timeout Error"), {
+      code: "UND_ERR_CONNECT_TIMEOUT",
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(
+        new TypeError("fetch failed", {
+          cause: connectError,
+        }),
+      ),
+    );
+
+    await expect(
+      action("search_alerts").execute(
+        context("search_alerts", {
+          indexPattern: "wazuh-alerts-*",
+        }),
+      ),
+    ).rejects.toThrow(
+      "Wazuh alert search to https://wazuh.example.com:9200 failed: connection timed out (UND_ERR_CONNECT_TIMEOUT)",
+    );
+  });
+
   it("rejects non-HTTP Wazuh index URLs before sending basic credentials", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
