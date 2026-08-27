@@ -30,6 +30,7 @@ function context(
     actionId,
     auth: {
       indexUrl: "https://wazuh.example.com:9200",
+      indexUsername: "wazuh-reader",
       indexPassword: "wazuh-secret",
     },
     input,
@@ -54,6 +55,10 @@ describe("Wazuh plugin package", () => {
               required: true,
             }),
             expect.objectContaining({
+              key: "indexUsername",
+              required: true,
+            }),
+            expect.objectContaining({
               key: "indexPassword",
               required: true,
             }),
@@ -64,6 +69,45 @@ describe("Wazuh plugin package", () => {
     expect(plugin.actions.map((candidate) => candidate.id)).toEqual(
       expect.arrayContaining(["query_issues", "search_alerts"]),
     );
+  });
+
+  it("round-trips the explicit username through source setup into plugin auth", async () => {
+    const persistedSetup = await plugin.dataSource?.resolveSetup?.({
+      pluginId: plugin.id,
+      setupValues: {
+        indexUrl: "https://wazuh.example.com:9200",
+        indexUsername: "wazuh-reader",
+        indexPassword: "wazuh-secret",
+        indexPatterns: ["wazuh-alerts-*"],
+      },
+      host,
+    });
+
+    expect(persistedSetup).toMatchObject({
+      accessTokenRef: "wazuh-secret",
+      configuration: {
+        baseUrl: "https://wazuh.example.com:9200",
+        indexUsername: "wazuh-reader",
+        indexPatterns: ["wazuh-alerts-*"],
+      },
+    });
+
+    const auth = await plugin.dataSource?.buildAuth?.({
+      pluginId: plugin.id,
+      source: {
+        sourceType: "wazuh",
+        accessTokenRef: persistedSetup?.accessTokenRef,
+        configuration: persistedSetup?.configuration ?? {},
+      },
+      host,
+    });
+
+    expect(auth).toMatchObject({
+      indexUrl: "https://wazuh.example.com:9200",
+      indexUsername: "wazuh-reader",
+      indexPassword: "wazuh-secret",
+      indexPatterns: ["wazuh-alerts-*"],
+    });
   });
 
   it("executes search_alerts through plugin-owned OpenSearch query code", async () => {
@@ -110,6 +154,9 @@ describe("Wazuh plugin package", () => {
         offset: 0,
         since: "2026-06-01T00:00:00.000Z",
         until: "2026-06-01T01:00:00.000Z",
+        include: "prod-api",
+        exclude: "test-agent",
+        afterTimestamp: "2026-05-31T23:00:00.000Z",
       }),
     );
 
@@ -129,10 +176,170 @@ describe("Wazuh plugin package", () => {
       method: "POST",
       redirect: "error",
       headers: {
-        Authorization: `Basic ${Buffer.from("admin:wazuh-secret").toString("base64")}`,
+        Authorization: `Basic ${Buffer.from("wazuh-reader:wazuh-secret").toString("base64")}`,
         "Content-Type": "application/json",
       },
     });
+
+    const body = JSON.parse(
+      typeof request?.body === "string" ? request.body : "{}",
+    );
+    expect(body).toMatchObject({
+      size: 2,
+      from: 0,
+      sort: [{ "@timestamp": "desc" }, { _index: "desc" }, { _id: "desc" }],
+      query: {
+        bool: {
+          must: expect.arrayContaining([
+            {
+              wildcard: {
+                "agent.name": {
+                  value: "*prod-api*",
+                  case_insensitive: true,
+                },
+              },
+            },
+            {
+              range: {
+                "@timestamp": {
+                  gt: "2026-05-31T23:00:00.000Z",
+                },
+              },
+            },
+          ]),
+          must_not: [
+            {
+              wildcard: {
+                "agent.name": {
+                  value: "*test-agent*",
+                  case_insensitive: true,
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("requires an explicit source username before sending credentials", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      action("search_alerts").execute({
+        ...context("search_alerts", { indexPattern: "wazuh-alerts-*" }),
+        auth: {
+          indexUrl: "https://wazuh.example.com:9200",
+          indexPassword: "wazuh-secret",
+        },
+      }),
+    ).rejects.toThrow("indexUsername is required");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses an opaque stable cursor for query_issues pagination", async () => {
+    const firstHit = {
+      _id: "alert-1",
+      _index: "wazuh-alerts-4.x-2026.06.01",
+      sort: [
+        "2026-06-01T00:05:00.000Z",
+        "wazuh-alerts-4.x-2026.06.01",
+        "alert-1",
+      ],
+      _source: {
+        "@timestamp": "2026-06-01T00:05:00.000Z",
+        rule: { id: "5710", level: 10, description: "first alert" },
+        agent: { name: "prod-api-1" },
+      },
+    };
+    const secondHit = {
+      _id: "alert-2",
+      _index: "wazuh-alerts-4.x-2026.06.01",
+      sort: [
+        "2026-06-01T00:04:00.000Z",
+        "wazuh-alerts-4.x-2026.06.01",
+        "alert-2",
+      ],
+      _source: {
+        "@timestamp": "2026-06-01T00:04:00.000Z",
+        rule: { id: "5711", level: 5, description: "second alert" },
+        agent: { name: "prod-api-2" },
+      },
+    };
+    const response = (hits: unknown[]) =>
+      new Response(
+        JSON.stringify({
+          hits: {
+            total: { value: 2, relation: "eq" },
+            hits,
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    const fetchMock = vi
+      .fn<(url: string, request?: RequestInit) => Promise<Response>>()
+      .mockResolvedValueOnce(response([firstHit, secondHit]))
+      .mockResolvedValueOnce(response([secondHit]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstResult = await action("query_issues").execute(
+      context("query_issues", { indexPattern: "wazuh-alerts-*", limit: 1 }),
+    );
+    const firstData = firstResult.data as Record<string, unknown>;
+    const nextCursor = firstData.nextCursor as string;
+
+    expect(firstData).toMatchObject({
+      hasMore: true,
+      nextCursor: expect.any(String),
+      issues: [
+        expect.objectContaining({
+          externalIssueId: expect.stringContaining("alert-1"),
+        }),
+      ],
+    });
+
+    const firstRequest = fetchMock.mock.calls[0]?.[1];
+    const firstBody = JSON.parse(
+      typeof firstRequest?.body === "string" ? firstRequest.body : "{}",
+    );
+    expect(firstBody).toMatchObject({
+      size: 2,
+      sort: [{ "@timestamp": "desc" }, { _index: "desc" }, { _id: "desc" }],
+    });
+    expect(firstBody).not.toHaveProperty("from");
+    expect(firstBody).not.toHaveProperty("search_after");
+
+    const secondResult = await action("query_issues").execute(
+      context("query_issues", {
+        indexPattern: "wazuh-alerts-*",
+        limit: 1,
+        cursor: nextCursor,
+      }),
+    );
+    const secondData = secondResult.data as Record<string, unknown>;
+    const secondRequest = fetchMock.mock.calls[1]?.[1];
+    const secondBody = JSON.parse(
+      typeof secondRequest?.body === "string" ? secondRequest.body : "{}",
+    );
+
+    expect(secondData).toMatchObject({
+      hasMore: false,
+      issues: [
+        expect.objectContaining({
+          externalIssueId: expect.stringContaining("alert-2"),
+        }),
+      ],
+    });
+    expect(secondData.nextCursor).toBeUndefined();
+    expect(secondBody).toMatchObject({
+      size: 2,
+      search_after: firstHit.sort,
+    });
+    expect(secondBody).not.toHaveProperty("from");
   });
 
   it("aborts an in-flight alert search when the parent operation is cancelled", async () => {
@@ -204,6 +411,7 @@ describe("Wazuh plugin package", () => {
         }),
         auth: {
           indexUrl: "file:///tmp/wazuh",
+          indexUsername: "wazuh-reader",
           indexPassword: "wazuh-secret",
         },
       }),

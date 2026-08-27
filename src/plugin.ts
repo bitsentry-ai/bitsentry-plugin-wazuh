@@ -2,6 +2,12 @@ import type { DesktopCodePlugin } from "@bitsentry/plugin-sdk";
 import { Effect } from "effect";
 
 const WAZUH_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_PAGE_SIZE = 100;
+const WAZUH_ALERT_SORT = [
+  { "@timestamp": "desc" },
+  { _index: "desc" },
+  { _id: "desc" },
+];
 
 type PluginOperationContext = {
   signal?: AbortSignal;
@@ -175,11 +181,15 @@ function readStringArray(value) {
 function resolveWazuhErrorSourceSetup(context) {
   const setupValues = readRecordOrEmpty(context.setupValues);
   const indexUrl = readString(setupValues.indexUrl);
+  const indexUsername = readString(setupValues.indexUsername);
   const indexPassword = readString(setupValues.indexPassword);
   const indexPatterns = readStringArray(setupValues.indexPatterns);
   const configuration: Record<string, unknown> = {};
   if (indexUrl.length > 0) {
     configuration.baseUrl = indexUrl;
+  }
+  if (indexUsername.length > 0) {
+    configuration.indexUsername = indexUsername;
   }
   if (indexPatterns.length > 0) {
     configuration.indexPatterns = indexPatterns;
@@ -197,6 +207,10 @@ function buildWazuhErrorSourceAuthFromParts(accessTokenRef, configuration) {
   const baseUrl = readString(config.baseUrl);
   if (baseUrl.length > 0) {
     auth.indexUrl = baseUrl;
+  }
+  const indexUsername = readString(config.indexUsername);
+  if (indexUsername.length > 0) {
+    auth.indexUsername = indexUsername;
   }
   const indexPassword = readString(accessTokenRef);
   if (indexPassword.length > 0) {
@@ -232,19 +246,56 @@ function readIsoTimestamp(value) {
   return new Date().toISOString();
 }
 
-function readCursorOffset(value) {
-  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
-    return value;
+function isSearchAfterValue(value) {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return true;
   }
 
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    if (Number.isInteger(parsed) && parsed >= 0) {
-      return parsed;
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function readSearchAfter(value) {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  if (typeof value !== "string") {
+    throw new Error("Wazuh cursor must be an opaque string.");
+  }
+
+  try {
+    const decoded = Buffer.from(value, "base64url").toString("utf8");
+    const parsed = JSON.parse(decoded);
+    if (
+      !Array.isArray(parsed) ||
+      parsed.length !== WAZUH_ALERT_SORT.length ||
+      parsed.some((item) => !isSearchAfterValue(item))
+    ) {
+      throw new Error("invalid cursor shape");
     }
+
+    return parsed;
+  } catch {
+    throw new Error("Wazuh cursor is invalid.");
+  }
+}
+
+function encodeSearchAfter(hit) {
+  if (
+    !Array.isArray(hit?.sort) ||
+    hit.sort.length !== WAZUH_ALERT_SORT.length ||
+    hit.sort.some((item) => !isSearchAfterValue(item))
+  ) {
+    throw new Error(
+      "Wazuh search response omitted stable sort values required for pagination.",
+    );
   }
 
-  return 0;
+  return Buffer.from(JSON.stringify(hit.sort), "utf8").toString("base64url");
 }
 
 function readPositiveInteger(value, fallback) {
@@ -390,6 +441,7 @@ function requireString(value, fieldName) {
 
 function buildQuery(input) {
   const must = [];
+  const mustNot = [];
   const query = readString(input.query, "*");
   if (query === "*") {
     must.push({ match_all: {} });
@@ -418,10 +470,48 @@ function buildQuery(input) {
     });
   }
 
+  const afterTimestamp = readString(input.afterTimestamp);
+  if (afterTimestamp.length > 0) {
+    must.push({
+      range: {
+        "@timestamp": {
+          gt: afterTimestamp,
+        },
+      },
+    });
+  }
+
+  const include = readString(input.include).toLowerCase();
+  if (include.length > 0) {
+    must.push({
+      wildcard: {
+        "agent.name": {
+          value: `*${include}*`,
+          case_insensitive: true,
+        },
+      },
+    });
+  }
+
+  const exclude = readString(input.exclude).toLowerCase();
+  if (exclude.length > 0) {
+    mustNot.push({
+      wildcard: {
+        "agent.name": {
+          value: `*${exclude}*`,
+          case_insensitive: true,
+        },
+      },
+    });
+  }
+
+  const bool: Record<string, unknown> = { must };
+  if (mustNot.length > 0) {
+    bool.must_not = mustNot;
+  }
+
   return {
-    bool: {
-      must,
-    },
+    bool,
   };
 }
 
@@ -466,15 +556,36 @@ function formatOutput(input) {
 async function searchAlerts(context) {
   const { auth, input } = context;
   const indexUrl = resolveWazuhIndexUrl(auth.indexUrl);
-  const indexUsername = readString(auth.indexUsername, "admin");
+  const indexUsername = requireString(auth.indexUsername, "indexUsername");
   const indexPassword = requireString(auth.indexPassword, "indexPassword");
-  const indexPattern = readString(input.indexPattern, "wazuh-alerts-*");
+  const configuredPatterns = readStringArray(auth.indexPatterns);
+  const indexPattern = readString(
+    input.indexPattern,
+    configuredPatterns[0] ?? "wazuh-alerts-*",
+  );
   const query = readString(input.query, "*");
-  const limit = Math.min(readPositiveInteger(input.limit, 20), 100);
-  const offset = readNonNegativeInteger(input.offset, 0);
+  const limit = Math.min(readPositiveInteger(input.limit, 20), MAX_PAGE_SIZE);
+  const searchAfter = readSearchAfter(input.cursor);
+  const hasLegacyOffset = input.offset !== undefined && input.offset !== null;
+  const offset =
+    searchAfter === undefined && hasLegacyOffset
+      ? readNonNegativeInteger(input.offset, 0)
+      : undefined;
+  const usesCursor = searchAfter !== undefined || !hasLegacyOffset;
+  const requestSize = usesCursor ? limit + 1 : limit;
   const credentials = Buffer.from(`${indexUsername}:${indexPassword}`).toString(
     "base64",
   );
+  const body: Record<string, unknown> = {
+    query: buildQuery(input),
+    size: requestSize,
+    sort: WAZUH_ALERT_SORT,
+  };
+  if (searchAfter !== undefined) {
+    body.search_after = searchAfter;
+  } else if (offset !== undefined) {
+    body.from = offset;
+  }
   const response = await runWazuhRequest(
     `Wazuh alert search to ${indexUrl}`,
     readOperationContext(context),
@@ -486,18 +597,7 @@ async function searchAlerts(context) {
           Authorization: `Basic ${credentials}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          query: buildQuery(input),
-          size: limit,
-          from: offset,
-          sort: [
-            {
-              "@timestamp": {
-                order: "desc",
-              },
-            },
-          ],
-        }),
+        body: JSON.stringify(body),
         signal,
       }),
   );
@@ -512,6 +612,7 @@ async function searchAlerts(context) {
           items: [],
           hasMore: false,
           total: 0,
+          nextCursor: undefined,
           output: "Wazuh alerts\nResults: 0",
         },
       };
@@ -526,9 +627,14 @@ async function searchAlerts(context) {
   }
 
   const payload = await response.json();
-  const items = Array.isArray(payload?.hits?.hits) ? payload.hits.hits : [];
-  const total = readTotalHits(payload, items.length);
-  const hasMore = offset + items.length < total;
+  const rawItems = Array.isArray(payload?.hits?.hits) ? payload.hits.hits : [];
+  const items = usesCursor ? rawItems.slice(0, limit) : rawItems;
+  const total = readTotalHits(payload, rawItems.length);
+  const hasMore = usesCursor
+    ? rawItems.length > limit
+    : (offset ?? 0) + items.length < total;
+  const nextCursor =
+    usesCursor && hasMore ? encodeSearchAfter(items.at(-1)) : undefined;
 
   return {
     ok: true,
@@ -538,6 +644,7 @@ async function searchAlerts(context) {
       items,
       hasMore,
       total,
+      nextCursor,
       output: formatOutput({
         indexPattern,
         query,
@@ -549,12 +656,10 @@ async function searchAlerts(context) {
 }
 
 async function queryIssues(context) {
-  const offset = readCursorOffset(context.input.cursor);
   const result = await searchAlerts({
     auth: context.auth,
     input: {
       ...context.input,
-      offset,
     },
     operation: readOperationContext(context),
   });
@@ -564,6 +669,7 @@ async function queryIssues(context) {
     .map((item) => mapAlertToIssue(item))
     .filter((item) => item !== undefined);
   const hasMore = data.hasMore === true && items.length > 0;
+  const nextCursor = readString(data.nextCursor) || undefined;
 
   return {
     ...result,
@@ -571,7 +677,7 @@ async function queryIssues(context) {
     data: {
       issues,
       hasMore,
-      nextCursor: hasMore ? String(offset + items.length) : undefined,
+      nextCursor: hasMore ? nextCursor : undefined,
       total: data.total,
       output: data.output,
     },
@@ -597,10 +703,17 @@ const plugin: DesktopCodePlugin = {
           control: "text",
         },
         {
+          key: "indexUsername",
+          label: "Wazuh index username",
+          placeholder: "wazuh-reader",
+          description: "Username for the Wazuh index user.",
+          required: true,
+          control: "text",
+        },
+        {
           key: "indexPassword",
           label: "Wazuh index password",
-          description:
-            "Password for the Wazuh index user. The username defaults to admin.",
+          description: "Password for the Wazuh index user.",
           required: true,
           control: "password",
         },
@@ -633,7 +746,6 @@ const plugin: DesktopCodePlugin = {
         label: "Wazuh index username",
         type: "string",
         required: true,
-        defaultValue: "admin",
       },
       {
         key: "indexPassword",
@@ -691,6 +803,24 @@ const plugin: DesktopCodePlugin = {
           type: "string",
           required: false,
         },
+        {
+          key: "include",
+          label: "Include agent",
+          type: "string",
+          required: false,
+        },
+        {
+          key: "exclude",
+          label: "Exclude agent",
+          type: "string",
+          required: false,
+        },
+        {
+          key: "afterTimestamp",
+          label: "After timestamp",
+          type: "string",
+          required: false,
+        },
       ],
       execute: queryIssues,
     },
@@ -727,6 +857,31 @@ const plugin: DesktopCodePlugin = {
           type: "number",
           required: false,
           defaultValue: 0,
+          description: "Legacy pagination. Use cursor for stable pagination.",
+        },
+        {
+          key: "cursor",
+          label: "Cursor",
+          type: "string",
+          required: false,
+        },
+        {
+          key: "include",
+          label: "Include agent",
+          type: "string",
+          required: false,
+        },
+        {
+          key: "exclude",
+          label: "Exclude agent",
+          type: "string",
+          required: false,
+        },
+        {
+          key: "afterTimestamp",
+          label: "After timestamp",
+          type: "string",
+          required: false,
         },
         {
           key: "since",
