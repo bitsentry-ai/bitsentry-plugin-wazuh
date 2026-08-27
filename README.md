@@ -16,3 +16,8 @@ archive:
 ```sh
 bitsentry plugin install wazuh
 ```
+
+Alert pagination cursors are versioned opaque values that include the sort
+order. A cursor must be replayed with the same `sortOrder` that created it.
+Cursors from the legacy raw-array format are deliberately rejected; restart
+the query without a cursor to receive a versioned cursor.

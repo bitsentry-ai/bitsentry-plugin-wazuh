@@ -3,11 +3,16 @@ import { Effect } from "effect";
 
 const WAZUH_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_PAGE_SIZE = 100;
-const WAZUH_ALERT_SORT = [
-  { "@timestamp": "desc" },
-  { _index: "desc" },
-  { _id: "desc" },
-];
+const DEFAULT_SORT_ORDER = "desc" as const;
+const WAZUH_CURSOR_VERSION = 1;
+const WAZUH_ALERT_SORT_FIELDS = ["@timestamp", "_index", "_id"] as const;
+type WazuhAlertSortOrder = "asc" | "desc";
+
+function buildAlertSort(sortOrder: WazuhAlertSortOrder) {
+  return WAZUH_ALERT_SORT_FIELDS.map((field) => ({
+    [field]: sortOrder,
+  }));
+}
 
 type PluginOperationContext = {
   signal?: AbortSignal;
@@ -258,7 +263,18 @@ function isSearchAfterValue(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function readSearchAfter(value) {
+function readSortOrder(value): WazuhAlertSortOrder {
+  if (value === undefined || value === null || value === "") {
+    return DEFAULT_SORT_ORDER;
+  }
+  if (value === "asc" || value === "desc") {
+    return value;
+  }
+
+  throw new Error("Wazuh sortOrder must be asc or desc.");
+}
+
+function readSearchAfter(value, sortOrder: WazuhAlertSortOrder) {
   if (value === undefined || value === null || value === "") {
     return undefined;
   }
@@ -267,27 +283,46 @@ function readSearchAfter(value) {
     throw new Error("Wazuh cursor must be an opaque string.");
   }
 
+  let parsed: unknown;
   try {
     const decoded = Buffer.from(value, "base64url").toString("utf8");
-    const parsed = JSON.parse(decoded);
-    if (
-      !Array.isArray(parsed) ||
-      parsed.length !== WAZUH_ALERT_SORT.length ||
-      parsed.some((item) => !isSearchAfterValue(item))
-    ) {
-      throw new Error("invalid cursor shape");
-    }
-
-    return parsed;
+    parsed = JSON.parse(decoded);
   } catch {
     throw new Error("Wazuh cursor is invalid.");
   }
+
+  if (Array.isArray(parsed)) {
+    throw new Error(
+      "Wazuh cursor uses the legacy raw-array format; restart pagination without a cursor.",
+    );
+  }
+
+  const envelope = readRecord(parsed);
+  const envelopeSortOrder = envelope?.sortOrder;
+  const envelopeSort = envelope?.sort;
+  if (
+    envelope?.v !== WAZUH_CURSOR_VERSION ||
+    (envelopeSortOrder !== "asc" && envelopeSortOrder !== "desc") ||
+    !Array.isArray(envelopeSort) ||
+    envelopeSort.length !== WAZUH_ALERT_SORT_FIELDS.length ||
+    envelopeSort.some((item) => !isSearchAfterValue(item))
+  ) {
+    throw new Error("Wazuh cursor is invalid.");
+  }
+
+  if (envelopeSortOrder !== sortOrder) {
+    throw new Error(
+      `Wazuh cursor sortOrder mismatch: cursor is ${envelopeSortOrder}, requested ${sortOrder}.`,
+    );
+  }
+
+  return envelopeSort;
 }
 
-function encodeSearchAfter(hit) {
+function encodeSearchAfter(hit, sortOrder: WazuhAlertSortOrder) {
   if (
     !Array.isArray(hit?.sort) ||
-    hit.sort.length !== WAZUH_ALERT_SORT.length ||
+    hit.sort.length !== WAZUH_ALERT_SORT_FIELDS.length ||
     hit.sort.some((item) => !isSearchAfterValue(item))
   ) {
     throw new Error(
@@ -295,7 +330,14 @@ function encodeSearchAfter(hit) {
     );
   }
 
-  return Buffer.from(JSON.stringify(hit.sort), "utf8").toString("base64url");
+  return Buffer.from(
+    JSON.stringify({
+      v: WAZUH_CURSOR_VERSION,
+      sortOrder,
+      sort: hit.sort,
+    }),
+    "utf8",
+  ).toString("base64url");
 }
 
 function readPositiveInteger(value, fallback) {
@@ -475,7 +517,7 @@ function buildQuery(input) {
     must.push({
       range: {
         "@timestamp": {
-          gt: afterTimestamp,
+          gte: afterTimestamp,
         },
       },
     });
@@ -565,7 +607,9 @@ async function searchAlerts(context) {
   );
   const query = readString(input.query, "*");
   const limit = Math.min(readPositiveInteger(input.limit, 20), MAX_PAGE_SIZE);
-  const searchAfter = readSearchAfter(input.cursor);
+  const sortOrder = readSortOrder(input.sortOrder);
+  const searchAfter = readSearchAfter(input.cursor, sortOrder);
+  const sort = buildAlertSort(sortOrder);
   const hasLegacyOffset = input.offset !== undefined && input.offset !== null;
   const offset =
     searchAfter === undefined && hasLegacyOffset
@@ -579,7 +623,7 @@ async function searchAlerts(context) {
   const body: Record<string, unknown> = {
     query: buildQuery(input),
     size: requestSize,
-    sort: WAZUH_ALERT_SORT,
+    sort,
   };
   if (searchAfter !== undefined) {
     body.search_after = searchAfter;
@@ -634,7 +678,9 @@ async function searchAlerts(context) {
     ? rawItems.length > limit
     : (offset ?? 0) + items.length < total;
   const nextCursor =
-    usesCursor && hasMore ? encodeSearchAfter(items.at(-1)) : undefined;
+    usesCursor && hasMore
+      ? encodeSearchAfter(items.at(-1), sortOrder)
+      : undefined;
 
   return {
     ok: true,
@@ -792,6 +838,13 @@ const plugin: DesktopCodePlugin = {
           required: false,
         },
         {
+          key: "sortOrder",
+          label: "Sort order",
+          type: "string",
+          required: false,
+          defaultValue: DEFAULT_SORT_ORDER,
+        },
+        {
           key: "since",
           label: "Since",
           type: "string",
@@ -864,6 +917,13 @@ const plugin: DesktopCodePlugin = {
           label: "Cursor",
           type: "string",
           required: false,
+        },
+        {
+          key: "sortOrder",
+          label: "Sort order",
+          type: "string",
+          required: false,
+          defaultValue: DEFAULT_SORT_ORDER,
         },
         {
           key: "include",
