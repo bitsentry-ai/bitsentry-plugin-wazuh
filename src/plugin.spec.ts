@@ -202,7 +202,7 @@ describe("Wazuh plugin package", () => {
             {
               range: {
                 "@timestamp": {
-                  gt: "2026-05-31T23:00:00.000Z",
+                  gte: "2026-05-31T23:00:00.000Z",
                 },
               },
             },
@@ -291,6 +291,13 @@ describe("Wazuh plugin package", () => {
     );
     const firstData = firstResult.data as Record<string, unknown>;
     const nextCursor = firstData.nextCursor as string;
+    expect(
+      JSON.parse(Buffer.from(nextCursor, "base64url").toString("utf8")),
+    ).toEqual({
+      v: 1,
+      sortOrder: "desc",
+      sort: firstHit.sort,
+    });
 
     expect(firstData).toMatchObject({
       hasMore: true,
@@ -340,6 +347,101 @@ describe("Wazuh plugin package", () => {
       search_after: firstHit.sort,
     });
     expect(secondBody).not.toHaveProperty("from");
+  });
+
+  it("rejects a cursor created with a different sort order", async () => {
+    const cursor = Buffer.from(
+      JSON.stringify({
+        v: 1,
+        sortOrder: "desc",
+        sort: [
+          "2026-06-01T00:05:00.000Z",
+          "wazuh-alerts-4.x-2026.06.01",
+          "alert-1",
+        ],
+      }),
+      "utf8",
+    ).toString("base64url");
+
+    await expect(
+      action("query_issues").execute(
+        context("query_issues", {
+          cursor,
+          sortOrder: "asc",
+        }),
+      ),
+    ).rejects.toThrow(
+      "Wazuh cursor sortOrder mismatch: cursor is desc, requested asc.",
+    );
+  });
+
+  it("rejects legacy raw-array cursors so pagination can restart safely", async () => {
+    const cursor = Buffer.from(
+      JSON.stringify([
+        "2026-06-01T00:05:00.000Z",
+        "wazuh-alerts-4.x-2026.06.01",
+        "alert-1",
+      ]),
+      "utf8",
+    ).toString("base64url");
+
+    await expect(
+      action("query_issues").execute(
+        context("query_issues", {
+          cursor,
+        }),
+      ),
+    ).rejects.toThrow(
+      "Wazuh cursor uses the legacy raw-array format; restart pagination without a cursor.",
+    );
+  });
+
+  it("sends ascending sort order when requested", async () => {
+    const fetchMock = vi
+      .fn<(url: string, request?: RequestInit) => Promise<Response>>()
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            hits: {
+              total: { value: 0, relation: "eq" },
+              hits: [],
+            },
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await action("search_alerts").execute(
+      context("search_alerts", {
+        sortOrder: "asc",
+        afterTimestamp: "2026-06-01T00:00:00.000Z",
+      }),
+    );
+
+    const request = fetchMock.mock.calls[0]?.[1];
+    const body = JSON.parse(
+      typeof request?.body === "string" ? request.body : "{}",
+    );
+    expect(body).toMatchObject({
+      sort: [{ "@timestamp": "asc" }, { _index: "asc" }, { _id: "asc" }],
+      query: {
+        bool: {
+          must: expect.arrayContaining([
+            {
+              range: {
+                "@timestamp": {
+                  gte: "2026-06-01T00:00:00.000Z",
+                },
+              },
+            },
+          ]),
+        },
+      },
+    });
   });
 
   it("aborts an in-flight alert search when the parent operation is cancelled", async () => {
