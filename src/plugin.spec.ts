@@ -349,6 +349,70 @@ describe("Wazuh plugin package", () => {
     expect(secondBody).not.toHaveProperty("from");
   });
 
+  it("uses offset pagination without timestamp sorting for vulnerability state indexes", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          hits: {
+            total: { value: 1, relation: "eq" },
+            hits: [
+              {
+                _id: "vulnerability-1",
+                _index: "wazuh-states-vulnerabilities-bitsentry-ubuntu",
+                _source: {
+                  agent: { id: "003", name: "bitsentry-sandbox" },
+                  package: {
+                    name: "cpio",
+                    version: "2.15+dfsg-1ubuntu2",
+                    source: "cpio",
+                  },
+                  vulnerability: {
+                    id: "CVE-2026-66485",
+                    status: "Active",
+                  },
+                },
+              },
+            ],
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await action("query_issues").execute(
+      context("query_issues", {
+        indexPattern: "wazuh-states-vulnerabilities-*",
+        query: 'agent.id:"003"',
+        limit: 10,
+      }),
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      status: 200,
+      data: {
+        hasMore: false,
+        issues: [
+          expect.objectContaining({
+            externalIssueId: expect.stringContaining("vulnerability-1"),
+          }),
+        ],
+      },
+    });
+
+    const request = fetchMock.mock.calls[0]?.[1];
+    const body = JSON.parse(
+      typeof request?.body === "string" ? request.body : "{}",
+    );
+    expect(body).toMatchObject({ size: 10, from: 0 });
+    expect(body).not.toHaveProperty("sort");
+    expect(body).not.toHaveProperty("search_after");
+  });
+
   it("rejects a cursor created with a different sort order", async () => {
     const cursor = Buffer.from(
       JSON.stringify({

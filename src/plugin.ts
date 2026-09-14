@@ -6,6 +6,7 @@ const MAX_PAGE_SIZE = 100;
 const DEFAULT_SORT_ORDER = "desc" as const;
 const WAZUH_CURSOR_VERSION = 1;
 const WAZUH_ALERT_SORT_FIELDS = ["@timestamp", "_index", "_id"] as const;
+const WAZUH_VULNERABILITY_INDEX_PREFIX = "wazuh-states-vulnerabilities-";
 type WazuhAlertSortOrder = "asc" | "desc";
 
 function buildAlertSort(sortOrder: WazuhAlertSortOrder) {
@@ -348,6 +349,14 @@ function readPositiveInteger(value, fallback) {
   return fallback;
 }
 
+function isVulnerabilityStateIndex(indexPattern) {
+  return indexPattern
+    .split(",")
+    .some((pattern) =>
+      pattern.trim().startsWith(WAZUH_VULNERABILITY_INDEX_PREFIX),
+    );
+}
+
 function readNonNegativeInteger(value, fallback) {
   if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
     return value;
@@ -607,15 +616,24 @@ async function searchAlerts(context) {
   );
   const query = readString(input.query, "*");
   const limit = Math.min(readPositiveInteger(input.limit, 20), MAX_PAGE_SIZE);
+  const usesOffsetPagination = isVulnerabilityStateIndex(indexPattern);
   const sortOrder = readSortOrder(input.sortOrder);
-  const searchAfter = readSearchAfter(input.cursor, sortOrder);
-  const sort = buildAlertSort(sortOrder);
+  if (usesOffsetPagination && input.cursor !== undefined) {
+    throw new Error(
+      "Wazuh cursor is not supported for vulnerability state indexes; restart pagination without a cursor.",
+    );
+  }
+  const searchAfter = usesOffsetPagination
+    ? undefined
+    : readSearchAfter(input.cursor, sortOrder);
   const hasLegacyOffset = input.offset !== undefined && input.offset !== null;
-  const offset =
-    searchAfter === undefined && hasLegacyOffset
+  const offset = usesOffsetPagination
+    ? readNonNegativeInteger(input.offset, 0)
+    : searchAfter === undefined && hasLegacyOffset
       ? readNonNegativeInteger(input.offset, 0)
       : undefined;
-  const usesCursor = searchAfter !== undefined || !hasLegacyOffset;
+  const usesCursor =
+    !usesOffsetPagination && (searchAfter !== undefined || !hasLegacyOffset);
   const requestSize = usesCursor ? limit + 1 : limit;
   const credentials = Buffer.from(`${indexUsername}:${indexPassword}`).toString(
     "base64",
@@ -623,8 +641,10 @@ async function searchAlerts(context) {
   const body: Record<string, unknown> = {
     query: buildQuery(input),
     size: requestSize,
-    sort,
   };
+  if (!usesOffsetPagination) {
+    body.sort = buildAlertSort(sortOrder);
+  }
   if (searchAfter !== undefined) {
     body.search_after = searchAfter;
   } else if (offset !== undefined) {
