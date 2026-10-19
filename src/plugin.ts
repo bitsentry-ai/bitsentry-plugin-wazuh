@@ -750,6 +750,436 @@ async function queryIssues(context) {
   };
 }
 
+const VULNERABILITY_STATE_PATTERN = `${WAZUH_VULNERABILITY_INDEX_PREFIX}*`;
+const MAX_AGENT_BUCKETS = 500;
+// OpenSearch serves offset pages only inside the first 10,000 hits.
+const MAX_FINDINGS_WINDOW = 10_000;
+// Exact below this many distinct CVEs, approximate above it.
+const CVE_COUNT_PRECISION = 40_000;
+const FINDING_DESCRIPTION_MAX = 300;
+const FINDING_SORT = [
+  { "agent.id": "asc" },
+  { "package.name": "asc" },
+  { "package.version": "asc" },
+  { "vulnerability.id": "asc" },
+];
+const FINDING_FIELDS = [
+  "agent.id",
+  "agent.name",
+  "host.os.full",
+  "host.os.name",
+  "host.os.platform",
+  "host.os.version",
+  "host.os.kernel",
+  "package.name",
+  "package.version",
+  "package.type",
+  "package.architecture",
+  "vulnerability.id",
+  "vulnerability.severity",
+  "vulnerability.score.base",
+  "vulnerability.under_evaluation",
+  "vulnerability.detected_at",
+  "vulnerability.published_at",
+  "vulnerability.description",
+  "wazuh.cluster.name",
+];
+
+function readList(value): string[] {
+  const items = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[,\n]/)
+      : [];
+  return readStringArray(items);
+}
+
+// The index stores "Critical", "High", "Medium" and "Low".
+function capitalize(value: string): string {
+  return `${value.charAt(0).toUpperCase()}${value.slice(1).toLowerCase()}`;
+}
+
+function readOptionalBoolean(value): boolean | undefined {
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  return undefined;
+}
+
+/** Exact-value filters only, so a count can be repeated on the Wazuh dashboard. */
+function buildVulnerabilityFilters(input) {
+  const applied: Record<string, string[] | boolean> = {};
+  const filter: Record<string, unknown>[] = [];
+  const terms = (key: string, field: string, values: string[]) => {
+    if (values.length === 0) return;
+    applied[key] = values;
+    filter.push({ terms: { [field]: values } });
+  };
+  terms(
+    "severity",
+    "vulnerability.severity",
+    readList(input.severity).map(capitalize),
+  );
+  terms("agentId", "agent.id", readList(input.agentId));
+  terms("agentName", "agent.name", readList(input.agentName));
+  terms("cluster", "wazuh.cluster.name", readList(input.cluster));
+  terms(
+    "osPlatform",
+    "host.os.platform",
+    readList(input.osPlatform).map((value) => value.toLowerCase()),
+  );
+  terms("packageType", "package.type", readList(input.packageType));
+  terms(
+    "cveId",
+    "vulnerability.id",
+    readList(input.cveId).map((value) => value.toUpperCase()),
+  );
+  const underEvaluation = readOptionalBoolean(input.underEvaluation);
+  if (underEvaluation !== undefined) {
+    applied.underEvaluation = underEvaluation;
+    filter.push({
+      term: { "vulnerability.under_evaluation": underEvaluation },
+    });
+  }
+
+  return {
+    applied,
+    query: filter.length === 0 ? { match_all: {} } : { bool: { filter } },
+  };
+}
+
+function readVulnerabilityIndexPattern(auth, input) {
+  const pattern = readString(
+    input.indexPattern,
+    readStringArray(auth.indexPatterns).find(isVulnerabilityStateIndex) ??
+      VULNERABILITY_STATE_PATTERN,
+  );
+  if (!isVulnerabilityStateIndex(pattern)) {
+    throw new Error(
+      `Wazuh vulnerability queries read ${VULNERABILITY_STATE_PATTERN} indexes only.`,
+    );
+  }
+
+  return pattern;
+}
+
+/** A failed request never reads as zero findings. */
+async function searchVulnerabilityStates(context, body) {
+  const { auth, input } = context;
+  const indexUrl = resolveWazuhIndexUrl(auth.indexUrl);
+  const indexUsername = requireString(auth.indexUsername, "indexUsername");
+  const indexPassword = requireString(auth.indexPassword, "indexPassword");
+  const indexPattern = readVulnerabilityIndexPattern(auth, input);
+  const credentials = Buffer.from(`${indexUsername}:${indexPassword}`).toString(
+    "base64",
+  );
+  const response = await runWazuhRequest(
+    `Wazuh vulnerability search to ${indexUrl}`,
+    readOperationContext(context),
+    (signal) =>
+      fetch(`${indexUrl}/${indexPattern}/_search`, {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          Authorization: `Basic ${credentials}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal,
+      }),
+  );
+
+  if (!response.ok) {
+    const detail = await response
+      .text()
+      .catch(() => "Unable to read error response");
+    const reason =
+      response.status === 401 || response.status === 403
+        ? "the index user was rejected"
+        : response.status === 404
+          ? `no index matches ${indexPattern}`
+          : "the search failed";
+    throw new Error(
+      `Wazuh vulnerability search failed: ${reason} (${String(response.status)} ${response.statusText}) - ${detail}`,
+    );
+  }
+
+  return { indexPattern, payload: await response.json() };
+}
+
+function readBuckets(aggregation): Record<string, unknown>[] {
+  const buckets = readRecord(aggregation)?.buckets;
+  return Array.isArray(buckets)
+    ? buckets.flatMap((bucket) => readRecord(bucket) ?? [])
+    : [];
+}
+
+function countBySeverity(aggregation): Record<string, number> {
+  return Object.fromEntries(
+    readBuckets(aggregation).map((bucket) => [
+      readString(bucket.key, "unknown"),
+      readNonNegativeInteger(bucket.doc_count, 0),
+    ]),
+  );
+}
+
+function formatCounts(counts: Record<string, number>): string {
+  const entries = Object.entries(counts);
+  return entries.length === 0
+    ? "none"
+    : entries.map(([key, count]) => `${key} ${String(count)}`).join(", ");
+}
+
+function formatFilters(applied: Record<string, string[] | boolean>): string {
+  const entries = Object.entries(applied);
+  return entries.length === 0
+    ? "none"
+    : entries
+        .map(
+          ([key, value]) =>
+            `${key}=${Array.isArray(value) ? value.join("|") : String(value)}`,
+        )
+        .join("; ");
+}
+
+async function summarizeVulnerabilities(context) {
+  const { applied, query } = buildVulnerabilityFilters(context.input);
+  const { indexPattern, payload } = await searchVulnerabilityStates(context, {
+    size: 0,
+    track_total_hits: true,
+    query,
+    aggs: {
+      severity: { terms: { field: "vulnerability.severity", size: 10 } },
+      pending: { filter: { term: { "vulnerability.under_evaluation": true } } },
+      cves: {
+        cardinality: {
+          field: "vulnerability.id",
+          precision_threshold: CVE_COUNT_PRECISION,
+        },
+      },
+      agents: {
+        terms: { field: "agent.id", size: MAX_AGENT_BUCKETS },
+        aggs: {
+          name: { terms: { field: "agent.name", size: 1 } },
+          platform: { terms: { field: "host.os.platform", size: 1 } },
+          severity: { terms: { field: "vulnerability.severity", size: 10 } },
+        },
+      },
+    },
+  });
+  const aggregations = readRecordOrEmpty(payload?.aggregations);
+  const total = readTotalHits(payload, 0);
+  const uniqueCves = readNonNegativeInteger(
+    readRecord(aggregations.cves)?.value,
+    0,
+  );
+  const agents = readBuckets(aggregations.agents).map((bucket) => ({
+    agentId: readString(bucket.key),
+    agentName: readString(readBuckets(bucket.name)[0]?.key) || undefined,
+    osPlatform: readString(readBuckets(bucket.platform)[0]?.key) || undefined,
+    total: readNonNegativeInteger(bucket.doc_count, 0),
+    bySeverity: countBySeverity(bucket.severity),
+  }));
+  const data = {
+    total,
+    bySeverity: countBySeverity(aggregations.severity),
+    pendingEvaluation: readNonNegativeInteger(
+      readRecord(aggregations.pending)?.doc_count,
+      0,
+    ),
+    uniqueCves,
+    uniqueCvesApproximate: uniqueCves > CVE_COUNT_PRECISION,
+    agents,
+    agentsTruncated:
+      readNonNegativeInteger(
+        readRecord(aggregations.agents)?.sum_other_doc_count,
+        0,
+      ) > 0,
+    filters: applied,
+    indexPattern,
+    retrievedAt: new Date().toISOString(),
+  };
+  const output = [
+    "Wazuh vulnerability summary",
+    `Index: ${indexPattern}`,
+    `Filters: ${formatFilters(applied)}`,
+    `Findings: ${String(total)} (${formatCounts(data.bySeverity)})`,
+    `Pending evaluation: ${String(data.pendingEvaluation)}`,
+    `Unique CVEs: ${String(uniqueCves)}${data.uniqueCvesApproximate ? " (approximate)" : ""}`,
+    ...agents.map(
+      (agent) =>
+        `- ${agent.agentId} ${agent.agentName ?? "unknown agent"} (${agent.osPlatform ?? "unknown OS"}): ${String(agent.total)} (${formatCounts(agent.bySeverity)})`,
+    ),
+    ...(data.agentsTruncated
+      ? [`More than ${String(MAX_AGENT_BUCKETS)} agents; narrow the filter.`]
+      : []),
+    `Retrieved: ${data.retrievedAt}`,
+  ].join("\n");
+
+  return {
+    ok: true,
+    status: 200,
+    summary: `Counted ${String(total)} Wazuh vulnerability findings.`,
+    data: { ...data, output },
+  };
+}
+
+function readPath(source: Record<string, unknown>, path: string): unknown {
+  return path
+    .split(".")
+    .reduce<unknown>((value, key) => readRecord(value)?.[key], source);
+}
+
+/** One finding with the dotted field names of a Wazuh CSV export, for the evaluator. */
+function mapVulnerabilityFinding(hit) {
+  const source = readRecordOrEmpty(hit?._source);
+  const finding: Record<string, unknown> = {};
+  for (const field of FINDING_FIELDS) {
+    const value = readPath(source, field);
+    if (typeof value === "string" && value.trim().length > 0) {
+      finding[field] =
+        field === "vulnerability.description" &&
+        value.length > FINDING_DESCRIPTION_MAX
+          ? `${value.slice(0, FINDING_DESCRIPTION_MAX - 1)}…`
+          : value;
+    } else if (
+      typeof value === "boolean" ||
+      (typeof value === "number" && Number.isFinite(value))
+    ) {
+      finding[field] = value;
+    }
+  }
+  const index = readString(hit?._index);
+  const id = readString(hit?._id);
+  if (index.length > 0) finding._index = index;
+  if (id.length > 0) finding._id = id;
+
+  return finding;
+}
+
+async function listVulnerabilities(context) {
+  const { input } = context;
+  const { applied, query } = buildVulnerabilityFilters(input);
+  const limit = Math.min(readPositiveInteger(input.limit, 50), MAX_PAGE_SIZE);
+  const offset = readNonNegativeInteger(input.offset, 0);
+  if (offset + limit > MAX_FINDINGS_WINDOW) {
+    throw new Error(
+      `Wazuh pages reach only the first ${String(MAX_FINDINGS_WINDOW)} findings of one filter; narrow it by agent or severity.`,
+    );
+  }
+  const { indexPattern, payload } = await searchVulnerabilityStates(context, {
+    size: limit,
+    from: offset,
+    track_total_hits: true,
+    sort: FINDING_SORT,
+    query,
+  });
+  const hits = Array.isArray(payload?.hits?.hits) ? payload.hits.hits : [];
+  const findings = hits.map(mapVulnerabilityFinding);
+  const total = readTotalHits(payload, findings.length);
+  const hasMore = offset + findings.length < total;
+  const output = [
+    "Wazuh vulnerability findings",
+    `Index: ${indexPattern}`,
+    `Filters: ${formatFilters(applied)}`,
+    `Showing ${String(offset + 1)}-${String(offset + findings.length)} of ${String(total)}`,
+    ...findings
+      .slice(0, 20)
+      .map(
+        (finding) =>
+          `- ${String(finding["agent.id"] ?? "?")} ${String(finding["package.name"] ?? "?")} ${String(finding["package.version"] ?? "?")} ${String(finding["vulnerability.id"] ?? "?")} ${String(finding["vulnerability.severity"] ?? "?")}`,
+      ),
+    ...(hasMore
+      ? [
+          `More findings available from offset ${String(offset + findings.length)}.`,
+        ]
+      : []),
+  ].join("\n");
+
+  return {
+    ok: true,
+    status: 200,
+    summary: `Fetched ${String(findings.length)} of ${String(total)} Wazuh vulnerability findings.`,
+    data: {
+      findings,
+      total,
+      offset,
+      hasMore,
+      nextOffset: hasMore ? offset + findings.length : undefined,
+      filters: applied,
+      indexPattern,
+      retrievedAt: new Date().toISOString(),
+      output,
+    },
+  };
+}
+
+const VULNERABILITY_FILTER_FIELDS = [
+  {
+    key: "severity",
+    label: "Severity",
+    type: "string",
+    required: false,
+    description: "Comma separated, for example Critical,High.",
+  },
+  {
+    key: "agentId",
+    label: "Agent ID",
+    type: "string",
+    required: false,
+    description: "Comma separated exact agent IDs, for example 003.",
+  },
+  {
+    key: "agentName",
+    label: "Agent name",
+    type: "string",
+    required: false,
+    description: "Comma separated exact agent names.",
+  },
+  {
+    key: "cluster",
+    label: "Cluster",
+    type: "string",
+    required: false,
+    description: "Exact wazuh.cluster.name, as filtered on the dashboard.",
+  },
+  {
+    key: "osPlatform",
+    label: "OS platform",
+    type: "string",
+    required: false,
+    description:
+      "Comma separated host.os.platform values, for example ubuntu,debian.",
+  },
+  {
+    key: "packageType",
+    label: "Package type",
+    type: "string",
+    required: false,
+    description: "Comma separated package.type values, for example deb.",
+  },
+  {
+    key: "cveId",
+    label: "CVE ID",
+    type: "string",
+    required: false,
+  },
+  {
+    key: "underEvaluation",
+    label: "Pending evaluation",
+    type: "boolean",
+    required: false,
+    description:
+      "true for findings still pending evaluation, false for evaluated ones.",
+  },
+  {
+    key: "indexPattern",
+    label: "Index pattern",
+    type: "string",
+    required: false,
+    defaultValue: VULNERABILITY_STATE_PATTERN,
+  },
+] as const;
+
 const plugin: DesktopCodePlugin = {
   type: "data_source",
   id: "wazuh",
@@ -977,6 +1407,40 @@ const plugin: DesktopCodePlugin = {
         },
       ],
       execute: searchAlerts,
+    },
+    {
+      id: "summarize_vulnerabilities",
+      title: "Summarize Wazuh vulnerabilities",
+      description:
+        "Count current Wazuh vulnerability findings by severity and agent, with exact totals and the filters used.",
+      riskLevel: "read",
+      fields: [...VULNERABILITY_FILTER_FIELDS],
+      execute: summarizeVulnerabilities,
+    },
+    {
+      id: "list_vulnerabilities",
+      title: "List Wazuh vulnerabilities",
+      description:
+        "List current Wazuh vulnerability findings one page at a time, with the fields the Linux CVE Status evaluator reads.",
+      riskLevel: "read",
+      fields: [
+        ...VULNERABILITY_FILTER_FIELDS,
+        {
+          key: "limit",
+          label: "Limit",
+          type: "number",
+          required: false,
+          defaultValue: 50,
+        },
+        {
+          key: "offset",
+          label: "Offset",
+          type: "number",
+          required: false,
+          defaultValue: 0,
+        },
+      ],
+      execute: listVulnerabilities,
     },
   ],
 };
