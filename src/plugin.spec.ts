@@ -585,3 +585,249 @@ describe("Wazuh plugin package", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("Wazuh vulnerability state actions", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function respond(payload: unknown, status = 200) {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(payload), {
+        status,
+        statusText: status === 200 ? "OK" : "Error",
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  function requestBody(fetchMock: ReturnType<typeof vi.fn>) {
+    const [url, request] = (fetchMock.mock.calls[0] ?? []) as [
+      string?,
+      RequestInit?,
+    ];
+    return {
+      url,
+      body: JSON.parse(
+        typeof request?.body === "string" ? request.body : "{}",
+      ) as unknown,
+    };
+  }
+
+  it("counts findings by severity and agent with exact totals and the filters used", async () => {
+    const fetchMock = respond({
+      hits: { total: { value: 1020, relation: "eq" }, hits: [] },
+      aggregations: {
+        severity: { buckets: [{ key: "Critical", doc_count: 1020 }] },
+        pending: { doc_count: 4 },
+        cves: { value: 352 },
+        agents: {
+          sum_other_doc_count: 0,
+          buckets: [
+            {
+              key: "003",
+              doc_count: 520,
+              name: { buckets: [{ key: "bitsentry-sandbox", doc_count: 520 }] },
+              platform: { buckets: [{ key: "ubuntu", doc_count: 520 }] },
+              severity: { buckets: [{ key: "Critical", doc_count: 520 }] },
+            },
+            {
+              key: "001",
+              doc_count: 500,
+              name: {
+                buckets: [{ key: "bitsentry-telemetry", doc_count: 500 }],
+              },
+              platform: { buckets: [{ key: "ubuntu", doc_count: 500 }] },
+              severity: { buckets: [{ key: "Critical", doc_count: 500 }] },
+            },
+          ],
+        },
+      },
+    });
+
+    const result = await action("summarize_vulnerabilities").execute(
+      context("summarize_vulnerabilities", {
+        severity: "critical",
+        cluster: "bitsentry-ubuntu-s-2vcpu-4gb-sgp1-01",
+        osPlatform: "Ubuntu,debian",
+      }),
+    );
+
+    const { url, body } = requestBody(fetchMock);
+    expect(url).toBe(
+      "https://wazuh.example.com:9200/wazuh-states-vulnerabilities-*/_search",
+    );
+    expect(body).toMatchObject({
+      size: 0,
+      track_total_hits: true,
+      query: {
+        bool: {
+          filter: [
+            { terms: { "vulnerability.severity": ["Critical"] } },
+            {
+              terms: {
+                "wazuh.cluster.name": ["bitsentry-ubuntu-s-2vcpu-4gb-sgp1-01"],
+              },
+            },
+            { terms: { "host.os.platform": ["ubuntu", "debian"] } },
+          ],
+        },
+      },
+    });
+    expect(result.data).toMatchObject({
+      total: 1020,
+      bySeverity: { Critical: 1020 },
+      pendingEvaluation: 4,
+      uniqueCves: 352,
+      uniqueCvesApproximate: false,
+      agentsTruncated: false,
+      agents: [
+        {
+          agentId: "003",
+          agentName: "bitsentry-sandbox",
+          osPlatform: "ubuntu",
+          total: 520,
+          bySeverity: { Critical: 520 },
+        },
+        {
+          agentId: "001",
+          agentName: "bitsentry-telemetry",
+          total: 500,
+        },
+      ],
+      filters: {
+        severity: ["Critical"],
+        cluster: ["bitsentry-ubuntu-s-2vcpu-4gb-sgp1-01"],
+        osPlatform: ["ubuntu", "debian"],
+      },
+    });
+    expect((result.data as { output: string }).output).toContain(
+      "Findings: 1020 (Critical 1020)",
+    );
+  });
+
+  it("lists one page of findings with the fields the evaluator reads", async () => {
+    const fetchMock = respond({
+      hits: {
+        total: { value: 3, relation: "eq" },
+        hits: [
+          {
+            _index: "wazuh-states-vulnerabilities-cluster",
+            _id: "003_abc_CVE-2026-1001",
+            _source: {
+              agent: {
+                id: "003",
+                name: "bitsentry-sandbox",
+                version: "v4.12.0",
+              },
+              host: {
+                os: {
+                  name: "Ubuntu",
+                  platform: "ubuntu",
+                  version: "24.04.4",
+                  kernel: "6.8.0-147-generic",
+                },
+              },
+              package: {
+                name: "linux-image-6.8.0-134-generic",
+                version: "6.8.0-134.134",
+                type: "deb",
+              },
+              vulnerability: {
+                id: "CVE-2026-1001",
+                severity: "Critical",
+                score: { base: 9.8 },
+                under_evaluation: false,
+                description: "x".repeat(400),
+              },
+              wazuh: { cluster: { name: "cluster" } },
+            },
+          },
+        ],
+      },
+    });
+
+    const result = await action("list_vulnerabilities").execute(
+      context("list_vulnerabilities", {
+        severity: "Critical",
+        agentId: "003",
+        limit: 1,
+        offset: 1,
+      }),
+    );
+
+    const { body } = requestBody(fetchMock);
+    expect(body).toMatchObject({
+      size: 1,
+      from: 1,
+      track_total_hits: true,
+      sort: [
+        { "agent.id": "asc" },
+        { "package.name": "asc" },
+        { "package.version": "asc" },
+        { "vulnerability.id": "asc" },
+      ],
+    });
+    const finding = (result.data as { findings: Record<string, unknown>[] })
+      .findings[0];
+    expect(finding).toMatchObject({
+      "agent.id": "003",
+      "agent.name": "bitsentry-sandbox",
+      "host.os.platform": "ubuntu",
+      "host.os.version": "24.04.4",
+      "host.os.kernel": "6.8.0-147-generic",
+      "package.name": "linux-image-6.8.0-134-generic",
+      "package.version": "6.8.0-134.134",
+      "vulnerability.id": "CVE-2026-1001",
+      "vulnerability.severity": "Critical",
+      "vulnerability.score.base": 9.8,
+      "vulnerability.under_evaluation": false,
+      _index: "wazuh-states-vulnerabilities-cluster",
+      _id: "003_abc_CVE-2026-1001",
+    });
+    expect(finding).not.toHaveProperty("vulnerability.status");
+    expect(finding["vulnerability.description"] as string).toHaveLength(300);
+    expect(result.data).toMatchObject({
+      total: 3,
+      offset: 1,
+      hasMore: true,
+      nextOffset: 2,
+    });
+  });
+
+  it.each([
+    [401, "the index user was rejected"],
+    [404, "no index matches wazuh-states-vulnerabilities-*"],
+  ])(
+    "reports a %s response as a failure, not as zero findings",
+    async (status, reason) => {
+      respond({ error: "denied" }, status);
+
+      await expect(
+        action("summarize_vulnerabilities").execute(
+          context("summarize_vulnerabilities", {}),
+        ),
+      ).rejects.toThrow(reason);
+    },
+  );
+
+  it("refuses alert indexes and pages past the first 10,000 findings", async () => {
+    const fetchMock = respond({ hits: { total: 0, hits: [] } });
+
+    await expect(
+      action("summarize_vulnerabilities").execute(
+        context("summarize_vulnerabilities", {
+          indexPattern: "wazuh-alerts-*",
+        }),
+      ),
+    ).rejects.toThrow("read wazuh-states-vulnerabilities-* indexes only");
+    await expect(
+      action("list_vulnerabilities").execute(
+        context("list_vulnerabilities", { offset: 9_990, limit: 20 }),
+      ),
+    ).rejects.toThrow("first 10000 findings");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
