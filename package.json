@@ -26,7 +26,8 @@
     "lint": "pnpm run lint:ts6",
     "lint:fix": "node scripts/eslint/verify-ts6-linter.mjs && eslint . --fix",
     "lint:ts6": "node scripts/eslint/verify-ts6-linter.mjs && eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "knip": "knip"
   },
   "repository": {
     "type": "git",
@@ -46,7 +47,8 @@
     "prettier": "^3.8.3",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.63.0",
-    "vitest": "^4.0.8"
+    "vitest": "^4.0.8",
+    "knip": "6.42.1"
   },
   "dependencies": {
     "effect": "3.22.0"
