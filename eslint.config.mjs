@@ -1,6 +1,7 @@
 import js from "@eslint/js";
 import globals from "globals";
 import tseslint from "typescript-eslint";
+import { readabilityConfigs } from "./scripts/eslint/readability-rules.mjs";
 
 const relaxedPluginRules = {
   "@typescript-eslint/no-explicit-any": "off",
@@ -43,4 +44,5 @@ export default tseslint.config(
       ...relaxedPluginRules,
     },
   },
+  ...readabilityConfigs({ files: ["src/**/*.ts"] }),
 );
