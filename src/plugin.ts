@@ -29,7 +29,7 @@ function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]) {
     (signal): signal is AbortSignal => signal !== undefined && !signal.aborted,
   );
 
-  if (signals.some((signal) => signal?.aborted === true)) {
+  if (signals.some((signal) => signal?.aborted)) {
     abort();
   } else {
     for (const signal of activeSignals) {
@@ -604,6 +604,37 @@ function formatOutput(input) {
   return lines.join("\n");
 }
 
+/**
+ * How an alert search pages: a vulnerability state index by offset only; an alert index by cursor, or by a legacy
+ * offset when the call gives one without a cursor.
+ */
+function readAlertPagination(input, indexPattern: string, sortOrder) {
+  if (isVulnerabilityStateIndex(indexPattern)) {
+    if (input.cursor !== undefined) {
+      throw new Error(
+        "Wazuh cursor is not supported for vulnerability state indexes; restart pagination without a cursor.",
+      );
+    }
+    return {
+      usesOffsetPagination: true,
+      searchAfter: undefined,
+      offset: readNonNegativeInteger(input.offset, 0),
+      usesCursor: false,
+    };
+  }
+  const searchAfter = readSearchAfter(input.cursor, sortOrder);
+  const hasLegacyOffset = input.offset !== undefined && input.offset !== null;
+  const usesLegacyOffset = searchAfter === undefined && hasLegacyOffset;
+  return {
+    usesOffsetPagination: false,
+    searchAfter,
+    offset: usesLegacyOffset
+      ? readNonNegativeInteger(input.offset, 0)
+      : undefined,
+    usesCursor: !usesLegacyOffset,
+  };
+}
+
 async function searchAlerts(context) {
   const { auth, input } = context;
   const indexUrl = resolveWazuhIndexUrl(auth.indexUrl);
@@ -616,24 +647,9 @@ async function searchAlerts(context) {
   );
   const query = readString(input.query, "*");
   const limit = Math.min(readPositiveInteger(input.limit, 20), MAX_PAGE_SIZE);
-  const usesOffsetPagination = isVulnerabilityStateIndex(indexPattern);
   const sortOrder = readSortOrder(input.sortOrder);
-  if (usesOffsetPagination && input.cursor !== undefined) {
-    throw new Error(
-      "Wazuh cursor is not supported for vulnerability state indexes; restart pagination without a cursor.",
-    );
-  }
-  const searchAfter = usesOffsetPagination
-    ? undefined
-    : readSearchAfter(input.cursor, sortOrder);
-  const hasLegacyOffset = input.offset !== undefined && input.offset !== null;
-  const offset = usesOffsetPagination
-    ? readNonNegativeInteger(input.offset, 0)
-    : searchAfter === undefined && hasLegacyOffset
-      ? readNonNegativeInteger(input.offset, 0)
-      : undefined;
-  const usesCursor =
-    !usesOffsetPagination && (searchAfter !== undefined || !hasLegacyOffset);
+  const { usesOffsetPagination, searchAfter, offset, usesCursor } =
+    readAlertPagination(input, indexPattern, sortOrder);
   const requestSize = usesCursor ? limit + 1 : limit;
   const credentials = Buffer.from(`${indexUsername}:${indexPassword}`).toString(
     "base64",
@@ -788,12 +804,9 @@ const FINDING_FIELDS = [
 ];
 
 function readList(value): string[] {
-  const items = Array.isArray(value)
-    ? value
-    : typeof value === "string"
-      ? value.split(/[,\n]/)
-      : [];
-  return readStringArray(items);
+  if (Array.isArray(value)) return readStringArray(value);
+  if (typeof value === "string") return readStringArray(value.split(/[,\n]/));
+  return [];
 }
 
 // The index stores "Critical", "High", "Medium" and "Low".
@@ -894,18 +907,22 @@ async function searchVulnerabilityStates(context, body) {
     const detail = await response
       .text()
       .catch(() => "Unable to read error response");
-    const reason =
-      response.status === 401 || response.status === 403
-        ? "the index user was rejected"
-        : response.status === 404
-          ? `no index matches ${indexPattern}`
-          : "the search failed";
+    const reason = vulnerabilitySearchFailure(response.status, indexPattern);
     throw new Error(
       `Wazuh vulnerability search failed: ${reason} (${String(response.status)} ${response.statusText}) - ${detail}`,
     );
   }
 
   return { indexPattern, payload: await response.json() };
+}
+
+function vulnerabilitySearchFailure(
+  status: number,
+  indexPattern: string,
+): string {
+  if (status === 401 || status === 403) return "the index user was rejected";
+  if (status === 404) return `no index matches ${indexPattern}`;
+  return "the search failed";
 }
 
 function readBuckets(aggregation): Record<string, unknown>[] {
