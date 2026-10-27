@@ -775,6 +775,8 @@ const FINDING_FIELDS = [
   "package.version",
   "package.type",
   "package.architecture",
+  // The exact file a non-Debian record was read from, which a host read can map to the package that installed it.
+  "package.path",
   "vulnerability.id",
   "vulnerability.severity",
   "vulnerability.score.base",
