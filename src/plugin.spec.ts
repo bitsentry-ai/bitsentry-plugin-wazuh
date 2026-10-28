@@ -797,6 +797,73 @@ describe("Wazuh vulnerability state actions", () => {
     });
   });
 
+  it("keeps the exact file of a Python record and adds no path to a Debian one", async () => {
+    const pyjwt =
+      "/usr/lib/python3/dist-packages/PyJWT-2.7.0.dist-info/METADATA";
+    respond({
+      hits: {
+        total: { value: 2, relation: "eq" },
+        hits: [
+          {
+            _index: "wazuh-states-vulnerabilities-cluster",
+            _id: "004_def_CVE-2026-102268",
+            _source: {
+              agent: { id: "004", name: "bitsentry-telemetry" },
+              host: { os: { name: "Ubuntu", platform: "ubuntu" } },
+              package: {
+                name: "PyJWT",
+                version: "2.7.0",
+                type: "pypi",
+                path: pyjwt,
+              },
+              vulnerability: { id: "CVE-2026-102268", severity: "Critical" },
+            },
+          },
+          {
+            _index: "wazuh-states-vulnerabilities-cluster",
+            _id: "004_abc_CVE-2026-89526",
+            _source: {
+              agent: { id: "004", name: "bitsentry-telemetry" },
+              host: { os: { name: "Ubuntu", platform: "ubuntu" } },
+              package: {
+                name: "linux-image-6.8.0-147-generic",
+                version: "6.8.0-147.147",
+                type: "deb",
+              },
+              vulnerability: { id: "CVE-2026-89526", severity: "Critical" },
+            },
+          },
+        ],
+      },
+    });
+
+    const result = await action("list_vulnerabilities").execute(
+      context("list_vulnerabilities", { severity: "Critical", agentId: "004" }),
+    );
+
+    const [python, kernel] = (
+      result.data as { findings: Record<string, unknown>[] }
+    ).findings;
+    expect(python).toMatchObject({
+      "package.name": "PyJWT",
+      "package.type": "pypi",
+      "package.path": pyjwt,
+    });
+    expect(kernel).toEqual({
+      "agent.id": "004",
+      "agent.name": "bitsentry-telemetry",
+      "host.os.name": "Ubuntu",
+      "host.os.platform": "ubuntu",
+      "package.name": "linux-image-6.8.0-147-generic",
+      "package.version": "6.8.0-147.147",
+      "package.type": "deb",
+      "vulnerability.id": "CVE-2026-89526",
+      "vulnerability.severity": "Critical",
+      _index: "wazuh-states-vulnerabilities-cluster",
+      _id: "004_abc_CVE-2026-89526",
+    });
+  });
+
   it.each([
     [401, "the index user was rejected"],
     [404, "no index matches wazuh-states-vulnerabilities-*"],
