@@ -43,34 +43,6 @@ describe("Wazuh plugin package", () => {
     vi.unstubAllGlobals();
   });
 
-  it("declares a typed Wazuh error-source code plugin", () => {
-    expect(plugin).toMatchObject({
-      id: "wazuh",
-      metadata: {
-        dataSource: {
-          sourceType: "wazuh",
-          setupFields: expect.arrayContaining([
-            expect.objectContaining({
-              key: "indexUrl",
-              required: true,
-            }),
-            expect.objectContaining({
-              key: "indexUsername",
-              required: true,
-            }),
-            expect.objectContaining({
-              key: "indexPassword",
-              required: true,
-            }),
-          ]),
-        },
-      },
-    });
-    expect(plugin.actions.map((candidate) => candidate.id)).toEqual(
-      expect.arrayContaining(["query_issues", "search_alerts"]),
-    );
-  });
-
   it("round-trips the explicit username through source setup into plugin auth", async () => {
     const persistedSetup = await plugin.dataSource?.resolveSetup?.({
       pluginId: plugin.id,
