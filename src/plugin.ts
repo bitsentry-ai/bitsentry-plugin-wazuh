@@ -616,7 +616,6 @@ function readAlertPagination(input, indexPattern: string, sortOrder) {
       );
     }
     return {
-      usesOffsetPagination: true,
       searchAfter: undefined,
       offset: readNonNegativeInteger(input.offset, 0),
       usesCursor: false,
@@ -626,7 +625,6 @@ function readAlertPagination(input, indexPattern: string, sortOrder) {
   const hasLegacyOffset = input.offset !== undefined && input.offset !== null;
   const usesLegacyOffset = searchAfter === undefined && hasLegacyOffset;
   return {
-    usesOffsetPagination: false,
     searchAfter,
     offset: usesLegacyOffset
       ? readNonNegativeInteger(input.offset, 0)
@@ -648,8 +646,12 @@ async function searchAlerts(context) {
   const query = readString(input.query, "*");
   const limit = Math.min(readPositiveInteger(input.limit, 20), MAX_PAGE_SIZE);
   const sortOrder = readSortOrder(input.sortOrder);
-  const { usesOffsetPagination, searchAfter, offset, usesCursor } =
-    readAlertPagination(input, indexPattern, sortOrder);
+  const usesOffsetPagination = isVulnerabilityStateIndex(indexPattern);
+  const { searchAfter, offset, usesCursor } = readAlertPagination(
+    input,
+    indexPattern,
+    sortOrder,
+  );
   const requestSize = usesCursor ? limit + 1 : limit;
   const credentials = Buffer.from(`${indexUsername}:${indexPassword}`).toString(
     "base64",
